@@ -1,4 +1,3 @@
-# sampleapp.py code
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
@@ -191,83 +190,39 @@ class OptimizedSlidingBuffer:
             self.chunks = []
             self.total_duration = 0
 
-
-
-class AudioProcessor:
-    def __init__(self):
-        self.sample_rate = 16000
-        self.sample_width = 2
-        self.channels = 1
-
-    def normalize_audio(self, audio_data, target_sample_rate=16000):
-        # Convert to mono and normalize sample rate
-        with wave.open(io.BytesIO(audio_data), 'rb') as wav:
-            n_channels = wav.getnchannels()
-            sampwidth = wav.getsampwidth()
-            framerate = wav.getframerate()
-            frames = wav.readframes(wav.getnframes())
-
-            # Convert to mono if necessary
-            if n_channels == 2:
-                frames = audioop.tomono(frames, sampwidth, 0.5, 0.5)
-
-            # Resample if necessary
-            if framerate != target_sample_rate:
-                frames = audioop.ratecv(frames, sampwidth, 1, framerate, 
-                                      target_sample_rate, None)[0]
-
-            return frames
 # Stream Processor
 class StreamProcessor:
     def __init__(self, socket_id):
         self.socket_id = socket_id
-        self.audio_buffer = io.BytesIO()
-        self.buffer_lock = threading.Lock()
+        self.buffer = OptimizedSlidingBuffer()
+        self.processing_queue = queue.Queue()
         self.is_processing = False
         self.should_stop = False
-        self.audio_processor = AudioProcessor()
-        self.transcriber = aai.Transcriber()
-        self.processing_queue = queue.Queue()
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        self.last_processed = 0
-        self.temp_files = []
-        self.min_audio_length = MIN_AUDIO_LENGTH
+        self.transcriber = aai.Transcriber()
         self.start_processing_thread()
 
 
     def start_processing_thread(self):
         self.thread_pool.submit(self._process_queue)
 
-    def process_chunk(self, chunk):
+    def process_chunk(self, chunk, duration):
         if self.should_stop:
+            return
+            
+        if not self.buffer.add_chunk(chunk, duration):
             return
 
         try:
-            with self.buffer_lock:
-                self.audio_buffer.write(chunk)
-                current_size = self.audio_buffer.tell()
-
-                # Process if buffer has enough data
-                if current_size >= CHUNK_SIZE * 10:  # Increased buffer size
-                    audio_data = self.audio_buffer.getvalue()
-                    self.audio_buffer = io.BytesIO()  # Reset buffer
-                    
-                    # Normalize audio
-                    normalized_audio = self.audio_processor.normalize_audio(audio_data)
-                    
-                    # Queue for processing
-                    self.processing_queue.put({
-                        'audio': normalized_audio,
-                        'timestamp': time.time()
-                    })
-
+            audio_data = self.buffer.get_buffer()
+            if len(audio_data) > 0:
+                self.processing_queue.put({
+                    'buffer': audio_data,
+                    'timestamp': time.time()
+                })
         except Exception as e:
             logger.error(f'Error processing chunk: {str(e)}')
-            socketio.emit('error', {
-                'error': 'Audio processing error',
-                'details': str(e)
-            }, room=self.socket_id)
-    
+
     def _process_queue(self):
         while not self.should_stop:
             try:
@@ -280,98 +235,44 @@ class StreamProcessor:
                 logger.error(f'Queue processing error: {str(e)}')
 
     def _process_audio(self, buffer, timestamp):
-        temp_file_path = None
         try:
-            # Create temp file with unique name
             with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
-                temp_file_path = temp_file.name
-                self.temp_files.append(temp_file_path)
                 temp_file.write(buffer)
-                
-                with wave.open(temp_file_path, 'wb') as wav_file:
-                    wav_file.setnchannels(1)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(16000)
-                    wav_file.writeframes(audio_data)
+                temp_file_path = temp_file.name
 
             # Log the file size for debugging
             file_size = os.path.getsize(temp_file_path)
-            if file_size < 1024:  # Skip if too small
-                return
-            
-            config = aai.TranscriptionConfig(
-                punctuate=True,
-                format_text=True,
-                language_detection=True,
-                audio_start_from=self.last_processed
-            )
+            logger.info(f'Processing audio file of size: {file_size} bytes')
 
-            # Transcribe
-            transcript = self.transcriber.transcribe(
-                temp_file_path,
-                config=config
-            )
+            if file_size > 0:
+                transcript = self.transcriber.transcribe(temp_file_path)
+                
+                if transcript and transcript.text:
+                    processed_text = pipeline.transform([transcript.text])
+                    prediction, confidence = ensemble_model.predict(processed_text)
 
-            if transcript and transcript.text:
-                # Update last processed timestamp
-                self.last_processed = timestamp
-
-                # Process transcribed text
-                processed_text = pipeline.transform([transcript.text])
-                prediction, confidence = ensemble_model.predict(processed_text)
-
-                # Emit results
-                socketio.emit('transcription', {
-                    'text': transcript.text,
-                    'analysis': {
-                        'prediction': bool(prediction[0]),
-                        'confidence': float(confidence[0])
-                    },
-                    'timestamp': timestamp
-                }, room=self.socket_id)
+                    socketio.emit('transcription', {
+                        'text': transcript.text,
+                        'analysis': {
+                            'prediction': bool(prediction[0]),
+                            'confidence': float(confidence[0])
+                        },
+                        'timestamp': timestamp
+                    }, room=self.socket_id)
 
         except Exception as e:
             logger.error(f'Audio processing error: {str(e)}')
-            socketio.emit('error', {
-                'error': 'Audio processing failed',
-                'details': str(e)
-            }, room=self.socket_id)
         finally:
-            if temp_file_path and os.path.exists(temp_file_path):
-                try:
-                    os.unlink(temp_file_path)
-                    self.temp_files.remove(temp_file_path)
-                except Exception as e:
-                    logger.error(f'Error removing temp file: {str(e)}')
-
-    def stop(self):
-        self.should_stop = True
-        self.thread_pool.shutdown(wait=False)
-        
-        # Clear buffer
-        with self.buffer_lock:
-            self.audio_buffer = io.BytesIO()
-        
-        # Clean up temp files
-        for temp_file in self.temp_files:
             try:
-                if os.path.exists(temp_file):
-                    os.unlink(temp_file)
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
             except Exception as e:
-                logger.error(f'Error removing temp file during shutdown: {str(e)}')
-        self.temp_files.clear()
+                logger.error(f'Error removing temp file: {str(e)}')
 
     def stop(self):
         self.should_stop = True
         self.thread_pool.shutdown(wait=False)
         self.buffer.clear()
-        for temp_file in self.temp_files:
-            try:
-                if os.path.exists(temp_file):
-                    os.unlink(temp_file)
-            except Exception as e:
-                logger.error(f'Error removing temp file during shutdown: {str(e)}')
-        self.temp_files.clear()
 
 # Load ML models with proper error handling
 try:
@@ -851,60 +752,24 @@ def handle_start_live(data):
         stream_processor = StreamProcessor(request.sid)
         active_streams[request.sid] = stream_processor
 
-        # Configure yt-dlp command with better options
-        command = [
+        # Start yt-dlp process
+        process = subprocess.Popen([
             'yt-dlp',
             '-x',
-            '--audio-format', 'wav',
-            '--audio-quality', '0',
+            '--audio-format', 'mp3',
             '--output', '-',
             '--no-playlist',
             '--live-from-start',
-            '--force-ipv4',  # More stable connection
-            '--retries', '3',  # Retry on failure
-            '--buffer-size', '16K',  # Larger buffer
             url
-        ]
-
-        # Start yt-dlp process
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=CHUNK_SIZE
-        )
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def process_stream():
             try:
-                def monitor_errors():
-                    for line in process.stderr:
-                        error_msg = line.decode().strip()
-                        if error_msg:
-                            logger.error(f'yt-dlp error: {error_msg}')
-                            socketio.emit('error', {
-                                'error': 'Stream error',
-                                'details': error_msg
-                            }, room=request.sid)
-
-                # Start error monitoring thread
-                error_thread = threading.Thread(target=monitor_errors)
-                error_thread.daemon = True
-                error_thread.start()
-
-                # Process audio stream
                 while True:
-                    chunk = process.stdout.read(CHUNK_SIZE)
+                    chunk = process.stdout.read(1024)
                     if not chunk:
                         break
-                    stream_processor.process_chunk(chunk)
-
-                    # Check process status
-                    if process.poll() is not None:
-                        error_output = process.stderr.read()
-                        if error_output:
-                            logger.error(f'yt-dlp process ended with error: {error_output.decode()}')
-                        break
-
+                    stream_processor.process_chunk(chunk, len(chunk))
             except Exception as e:
                 logger.error(f'Stream processing error: {str(e)}')
                 socketio.emit('error', {
@@ -912,10 +777,7 @@ def handle_start_live(data):
                     'details': str(e)
                 }, room=request.sid)
             finally:
-                try:
-                    process.terminate()
-                except:
-                    pass
+                process.terminate()
                 if request.sid in active_streams:
                     active_streams[request.sid].stop()
                     del active_streams[request.sid]
@@ -936,6 +798,7 @@ def handle_start_live(data):
             'error': 'Failed to process message',
             'details': str(e)
         }, room=request.sid)
+
 # Error Handler
 @app.errorhandler(Exception)
 def handle_error(error):
