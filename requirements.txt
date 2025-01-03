@@ -10,7 +10,6 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 assemblyai
 python-dotenv
-concurrent.futures
 bs4
 wave
 pathlib
