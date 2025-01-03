@@ -863,7 +863,7 @@ if __name__ == '__main__':
                 """)
  
         logger.info(f'Server running at http://localhost:{PORT}')
-        socketio.run(app, host='0.0.0.0', port=PORT, debug=False)
+        socketio.run(app, host='0.0.0.0', port=PORT, debug=False,allow_unsafe_werkzeug=True)
     except Exception as e:
         logger.error(f'Server startup error: {str(e)}')
         raise
