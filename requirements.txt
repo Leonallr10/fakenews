@@ -13,4 +13,4 @@ python-dotenv
 bs4
 wave
 pathlib
-shutil
+
